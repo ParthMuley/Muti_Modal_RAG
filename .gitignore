@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+qdrant_data/
+scraped_content/
+extracted_images/
+found_links.json
+*.png
+readme.pdf

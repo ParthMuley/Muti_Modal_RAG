@@ -1,0 +1,11 @@
+llama-index
+llama-index-llms-gemini
+llama-index-embeddings-gemini
+llama-index-embeddings-huggingface
+llama-index-vector-stores-qdrant
+qdrant-client
+streamlit
+python-dotenv
+pdf2image
+pdfplumber
+Pillow
