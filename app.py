@@ -4,12 +4,13 @@ import qdrant_client
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.core import Settings
 from ingest import setup_settings
 from config import QDRANT_PATH, COLLECTION_NAME, MODEL_PROVIDER, RERANK_MODEL_NAME
 
 # --- Streamlit UI Setup ---
 st.set_page_config(
-    page_title="SOTA MultiModal RAG", 
+    page_title="SOTA MultiModal RAG (Agentic)", 
     page_icon="🤖", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -23,17 +24,17 @@ with st.sidebar:
     st.write("---")
     st.markdown("""
     ### 🛡️ SOTA Features:
-    - **Cross-Encoder Reranking:** Filters top 10 results down to 5.
-    - **Multi-Vector Retrieval:** Search image descriptions.
-    - **Local-First:** Ollama/Llama3.2 for reasoning.
+    - **Contextual Retrieval:** Anthropic method (Global Hints).
+    - **Agentic Self-Correction:** Evaluates context before answering.
+    - **Cross-Encoder Reranking:** Filters top 10 results.
     """)
     
     if st.button("🔄 Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
 
-st.title("🤖 MultiModal RAG Assistant (SOTA Edition)")
-st.markdown(f"**Current State:** 🚀 *Reranker Enabled* | *Provider:* {MODEL_PROVIDER}")
+st.title("🤖 Agentic MultiModal RAG Assistant")
+st.markdown(f"**Mode:** 🚀 *Self-Correction & Contextual Retrieval Enabled*")
 
 def initialize_engine():
     """Initializes the query engine with Qdrant + SOTA Reranking."""
@@ -48,8 +49,6 @@ def initialize_engine():
     
     index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
     
-    # SETUP SOTA RERANKER
-    # We retrieve 10 nodes (fast) then let the Reranker pick the top 5 (accurate)
     rerank_postprocessor = SentenceTransformerRerank(
         model=RERANK_MODEL_NAME, 
         top_n=5
@@ -79,56 +78,80 @@ if "query_engine" not in st.session_state:
     with st.spinner(f"Loading {MODEL_PROVIDER} & BGE Reranker..."):
         st.session_state.query_engine = initialize_engine()
 
+def agentic_query(prompt):
+    """
+    Agentic Loop:
+    1. Retrieve & Rerank.
+    2. Evaluate if context is enough.
+    3. Re-query if not.
+    4. Synthesize.
+    """
+    with st.status("🔍 Processing Query (Agentic Loop)...") as status:
+        # Step 1: Initial Retrieval
+        status.update(label="📡 Retrieving initial context...")
+        response = st.session_state.query_engine.query(prompt)
+        
+        # Step 2: Evaluation
+        status.update(label="🧠 Evaluating context sufficiency...")
+        eval_prompt = f"Given the following retrieved context, can the question '{prompt}' be answered accurately? \n\nContext: {response.source_nodes[0].text[:1000]}... \n\nAnswer only 'YES' or 'NO'."
+        eval_result = str(Settings.llm.complete(eval_prompt)).strip().upper()
+        
+        if "NO" in eval_result:
+            status.update(label="🔄 Context insufficient. Attempting re-query with expansion...")
+            # Simple rephrase for better retrieval
+            rephrase_prompt = f"Rephrase this technical question to be more specific for a vector search: {prompt}"
+            better_query = str(Settings.llm.complete(rephrase_prompt)).strip()
+            response = st.session_state.query_engine.query(better_query)
+        
+        status.update(label="✍️ Synthesizing final answer...", state="complete")
+        return response
+
 # Chat Input
-if prompt := st.chat_input("Ask about technical docs or diagrams..."):
+if prompt := st.chat_input("Ask a technical question..."):
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        with st.spinner("🔍 Retrieving and Reranking Context..."):
-            try:
-                response = st.session_state.query_engine.query(prompt)
-                
-                final_text = response.response
-                source_nodes = response.source_nodes
-                
-                # Extract unique images from reranked results
-                retrieved_images = []
-                seen_paths = set()
+        try:
+            response = agentic_query(prompt)
+            
+            final_text = response.response
+            source_nodes = response.source_nodes
+            
+            # Extract unique images
+            retrieved_images = []
+            seen_paths = set()
+            for node in source_nodes:
+                if "image_path" in node.metadata:
+                    img_path = node.metadata["image_path"]
+                    if os.path.exists(img_path) and img_path not in seen_paths:
+                        retrieved_images.append({
+                            "path": img_path,
+                            "caption": f"Retrieved from Page {node.metadata.get('page', '?')}"
+                        })
+                        seen_paths.add(img_path)
+
+            st.markdown(final_text)
+            
+            if retrieved_images:
+                st.write("---")
+                st.markdown("### 🖼️ Relevant Diagrams")
+                cols = st.columns(2)
+                for idx, img in enumerate(retrieved_images):
+                    with cols[idx % 2]:
+                        st.image(img["path"], caption=img["caption"], use_container_width=True)
+
+            with st.expander("🔍 View Contextualized Source Nodes"):
                 for node in source_nodes:
-                    if "image_path" in node.metadata:
-                        img_path = node.metadata["image_path"]
-                        if os.path.exists(img_path) and img_path not in seen_paths:
-                            retrieved_images.append({
-                                "path": img_path,
-                                "caption": f"Retrieved (Score: {node.score:.2f}) from Page {node.metadata.get('page', '?')}"
-                            })
-                            seen_paths.add(img_path)
+                    st.write(f"**Score:** `{node.score:.4f}`")
+                    st.info(node.text) # Text is now contextualized with global hints
+                    st.divider()
 
-                st.markdown(final_text)
-                
-                if retrieved_images:
-                    st.write("---")
-                    st.markdown("### 🖼️ Relevant Diagrams (Reranked)")
-                    cols = st.columns(2)
-                    for idx, img in enumerate(retrieved_images):
-                        with cols[idx % 2]:
-                            st.image(img["path"], caption=img["caption"], use_container_width=True)
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": final_text,
+                "images": retrieved_images
+            })
 
-                with st.expander("🔍 View Reranked Context & Confidence"):
-                    for node in source_nodes:
-                        st.write(f"**Type:** `{node.metadata.get('type', 'Unknown')}` | **Rerank Score:** `{node.score:.4f}`")
-                        if "image_path" in node.metadata:
-                            st.info(f"🖼️ **Diagram:** {node.text}")
-                        else:
-                            st.text(node.text[:600] + "...")
-                        st.divider()
-
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": final_text,
-                    "images": retrieved_images
-                })
-
-            except Exception as e:
-                st.error(f"Error: {e}")
+        except Exception as e:
+            st.error(f"Error: {e}")

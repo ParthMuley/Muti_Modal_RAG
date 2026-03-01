@@ -21,9 +21,9 @@ from multimodal_utils import extract_images_from_pdf, generate_caption
 
 MANIFEST_FILE = "ingestion_manifest.json"
 CAPTION_CACHE_FILE = "caption_cache.json"
+CHUNK_CONTEXT_CACHE_FILE = "chunk_context_cache.json"
 
 def get_file_hash(file_path):
-    """Generates an MD5 hash of a file to detect changes."""
     hasher = hashlib.md5()
     with open(file_path, 'rb') as f:
         buf = f.read()
@@ -41,7 +41,6 @@ def save_json(file_path, data):
         json.dump(data, f, indent=4)
 
 def setup_settings():
-    """Configure LlamaIndex based on the selected provider."""
     if MODEL_PROVIDER == "OLLAMA":
         Settings.llm = Ollama(model=OLLAMA_TEXT_MODEL, base_url=OLLAMA_BASE_URL, request_timeout=120.0)
     else:
@@ -51,20 +50,29 @@ def setup_settings():
     Settings.chunk_size = 512
     Settings.chunk_overlap = 50
 
+def generate_chunk_context(doc_title, chunk_text):
+    """Generates a 1-sentence context for a chunk to improve retrieval (Anthropic method)."""
+    prompt = f"You are an expert document analyzer. Given the document titled '{doc_title}', provide a single brief sentence that explains where this chunk fits in the overall document context. \n\nChunk: {chunk_text[:500]}..."
+    try:
+        response = Settings.llm.complete(prompt)
+        return str(response).strip()
+    except Exception as e:
+        print(f"Error generating chunk context: {e}")
+        return ""
+
 def ingest_data():
     setup_settings()
     manifest = load_json(MANIFEST_FILE)
     caption_cache = load_json(CAPTION_CACHE_FILE)
+    chunk_context_cache = load_json(CHUNK_CONTEXT_CACHE_FILE)
     
-    # Initialize Qdrant Client
     client = qdrant_client.QdrantClient(path=QDRANT_PATH)
     vector_store = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    new_nodes = []
-    files_processed = 0
+    all_nodes = []
 
-    # --- 1. Process PDFs ---
+    # --- 1. Process PDFs with Contextual Retrieval ---
     if os.path.exists(DATA_DIR):
         pdf_files = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf")]
         for pdf_file in pdf_files:
@@ -73,31 +81,40 @@ def ingest_data():
             
             if manifest.get(pdf_file) == current_hash:
                 print(f"Skipping PDF (No changes): {pdf_file}")
+                # We still need to load nodes for the indexer if we were doing a full rebuild,
+                # but for simplicity in this MVP, we only append new ones.
                 continue
             
-            print(f"Processing NEW or CHANGED PDF: {pdf_file}")
-            # If changed, we'd ideally delete old vectors here, but for MVP we just add and update manifest
+            print(f"Processing PDF with Contextual Retrieval: {pdf_file}")
             reader = SimpleDirectoryReader(input_files=[file_path])
             documents = reader.load_data()
-            for doc in documents:
-                node = TextNode(text=doc.text, metadata=doc.metadata)
-                node.metadata["type"] = "text"
-                new_nodes.append(node)
             
-            # --- Handle Images within this PDF ---
+            for i, doc in enumerate(documents):
+                chunk_id = f"{pdf_file}_{i}"
+                if chunk_id in chunk_context_cache:
+                    context_hint = chunk_context_cache[chunk_id]
+                else:
+                    print(f"Generating context for chunk {i+1}/{len(documents)}...")
+                    context_hint = generate_chunk_context(pdf_file, doc.text)
+                    chunk_context_cache[chunk_id] = context_hint
+                    save_json(CHUNK_CONTEXT_CACHE_FILE, chunk_context_cache)
+                
+                # PREPEND CONTEXT (SOTA Anthropic Method)
+                contextualized_text = f"DOCUMENT CONTEXT: {context_hint}\n\nCONTENT: {doc.text}"
+                node = TextNode(text=contextualized_text, metadata=doc.metadata)
+                node.metadata["type"] = "text"
+                all_nodes.append(node)
+            
+            # Images
             image_data = extract_images_from_pdf(file_path, EXTRACTED_IMAGES_DIR)
             for i, img_info in enumerate(image_data):
                 img_path = img_info["path"]
-                if img_path in caption_cache:
-                    caption = caption_cache[img_path]
-                else:
-                    print(f"Generating caption for {img_path}...")
-                    caption = generate_caption(img_path)
-                    caption_cache[img_path] = caption
-                    save_json(CAPTION_CACHE_FILE, caption_cache)
+                caption = caption_cache.get(img_path) or generate_caption(img_path)
+                caption_cache[img_path] = caption
+                save_json(CAPTION_CACHE_FILE, caption_cache)
 
                 image_node = TextNode(
-                    text=f"Image Diagram Description: {caption}",
+                    text=f"IMAGE CONTEXT: This diagram is from {pdf_file}.\nDESCRIPTION: {caption}",
                     metadata={
                         "image_path": img_path,
                         "type": "image",
@@ -105,10 +122,9 @@ def ingest_data():
                         "page": img_info["page"]
                     }
                 )
-                new_nodes.append(image_node)
+                all_nodes.append(image_node)
             
             manifest[pdf_file] = current_hash
-            files_processed += 1
 
     # --- 2. Process Web Content ---
     if os.path.exists(SCRAPED_CONTENT_DIR):
@@ -116,32 +132,23 @@ def ingest_data():
         for web_file in web_files:
             file_path = os.path.join(SCRAPED_CONTENT_DIR, web_file)
             current_hash = get_file_hash(file_path)
+            if manifest.get(web_file) == current_hash: continue
             
-            if manifest.get(web_file) == current_hash:
-                continue
-                
-            print(f"Processing new web content: {web_file}")
+            print(f"Processing web content: {web_file}")
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             
             node = TextNode(text=content, metadata={"source": web_file, "type": "web_content"})
-            new_nodes.append(node)
+            all_nodes.append(node)
             manifest[web_file] = current_hash
-            files_processed += 1
 
-    # --- 3. Update Index ---
-    if new_nodes:
-        print(f"Adding {len(new_nodes)} new nodes to Qdrant...")
-        # If the collection doesn't exist, this creates it. If it does, it appends.
-        index = VectorStoreIndex(
-            new_nodes, 
-            storage_context=storage_context, 
-            show_progress=True
-        )
+    if all_nodes:
+        print(f"Indexing {len(all_nodes)} nodes with Contextual Retrieval...")
+        index = VectorStoreIndex(all_nodes, storage_context=storage_context, show_progress=True)
         save_json(MANIFEST_FILE, manifest)
         print("Ingestion complete!")
     else:
-        print("No new content to ingest. Database is up to date.")
+        print("No new content to ingest.")
 
 if __name__ == "__main__":
     ingest_data()
